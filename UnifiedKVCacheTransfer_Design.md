@@ -68,13 +68,48 @@ class FlexFlow:
         backends: list[str] = ("auto",),      # auto 探测: nvlink, rdma, gds, store
         metadata_server: str | None = None,   # etcd/redis/bootstrap 地址；None=纯P2P
         topology: "Topology | None" = None,   # None 则自动发现
+        selector_config: "SelectorConfig | None" = None,  # 路径选择器调参；None=默认
     ): ...
 
     def discover_topology(self) -> "Topology": ...   # NVML+sysfs，亲和性来源
+    def update_selector_config(self, cfg: "SelectorConfig"): ...  # 运行时可热更新
 ```
 
 一个进程一个 `FlexFlow`，内部聚合：NIXL/Mooncake agent + 拓扑 + 路径选择器 + 完成轮询线程。
 `role` 决定加载哪些能力，但 API 表面统一。
+
+**`selector_config` —— 初始化阶段可指定路径选择器的打分权重 / QoS 阈值 / SplitPath 策略**
+（沿用老 FlexFlow 的 `SelectorConfig` 语义；不传则用默认值）：
+
+```python
+from flexflow import FlexFlow, SelectorConfig
+
+cfg = SelectorConfig()
+# 打分权重
+cfg.w_bandwidth   = 1.0   # 带宽收益权重
+cfg.w_queue_delay = 0.5   # 拥塞惩罚权重
+cfg.w_hops        = 0.2   # 跳数惩罚权重
+cfg.w_qos_risk    = 0.3   # QoS 干扰风险权重
+cfg.w_latency     = 0.5   # TTFT 延迟惩罚权重
+
+# QoS 阈值（链路利用率超过则拒绝该路径，保护推理流量）
+cfg.nvlink_util_threshold = 0.80
+cfg.rdma_util_threshold   = 0.80
+cfg.cnic_util_threshold   = 0.70
+cfg.snic_util_threshold   = 0.85
+
+# SplitPath 多路拆分
+cfg.enable_split_path    = True
+cfg.max_split_paths      = 2
+cfg.split_benefit_margin = 0.15  # 拆分须比单路快 15% 才采用
+
+eng = FlexFlow(rank=0, device=0, role="both", selector_config=cfg)
+# 也可运行时热更新：eng.update_selector_config(cfg)
+```
+
+> 设计取舍：`SelectorConfig` 是**引擎级**的全局策略（拓扑亲和、QoS 保护、拆分阈值），
+> 在初始化时指定一次即可全程生效；而**单次传输级**的临时策略（如某请求 TTFT 敏感、
+> 优先级）则通过 `submit(..., hint=TransferHint(...))` 传入，二者分工清晰。
 
 ### 4.2 内存池 / 显存池注册接口
 
@@ -208,6 +243,33 @@ class PathSelector:
 关键：**亲和性判断的输入来自 `register_pool` 时记录的 `(device, numa, nic)` 和拓扑图**。
 `hint.ttft_sensitive=True` 时惩罚多跳（PD 首 token 延迟敏感场景直接受益）。
 
+PathSelector 的行为由初始化时传入的 `SelectorConfig` 驱动（见 4.1）：
+
+```python
+@dataclass
+class SelectorConfig:
+    # 打分权重（score = w_bandwidth*带宽收益 - w_queue_delay*拥塞 - w_hops*跳数
+    #                  - w_qos_risk*QoS风险 - w_latency*TTFT延迟）
+    w_bandwidth: float = 1.0
+    w_queue_delay: float = 0.5
+    w_hops: float = 0.2
+    w_qos_risk: float = 0.3
+    w_latency: float = 0.5
+    # QoS 阈值（链路利用率超过则拒绝该路径，保护推理流量）
+    nvlink_util_threshold: float = 0.80
+    rdma_util_threshold: float = 0.80
+    cnic_util_threshold: float = 0.70
+    snic_util_threshold: float = 0.85
+    # SplitPath 多路拆分
+    enable_split_path: bool = True
+    max_split_paths: int = 2
+    split_benefit_margin: float = 0.15   # 拆分须比单路快 15% 才采用
+    relay_benefit_margin: float = 0.10   # 中继须比直连快 10% 才采用
+```
+
+> `SelectorConfig` 是引擎级全局策略，初始化时 `FlexFlow(..., selector_config=cfg)` 指定，
+> 或运行时 `update_selector_config()` 热更新；单请求级策略走 `TransferHint`。
+
 ---
 
 ## 7. 完整 Python 接口草图
@@ -240,10 +302,31 @@ class TransferHint:
     allow_relay: bool = True
     allow_split: bool = True
 
+@dataclass
+class SelectorConfig:
+    # 打分权重
+    w_bandwidth: float = 1.0
+    w_queue_delay: float = 0.5
+    w_hops: float = 0.2
+    w_qos_risk: float = 0.3
+    w_latency: float = 0.5
+    # QoS 阈值（保护推理流量）
+    nvlink_util_threshold: float = 0.80
+    rdma_util_threshold: float = 0.80
+    cnic_util_threshold: float = 0.70
+    snic_util_threshold: float = 0.85
+    # SplitPath / Relay
+    enable_split_path: bool = True
+    max_split_paths: int = 2
+    split_benefit_margin: float = 0.15
+    relay_benefit_margin: float = 0.10
+
 # ---------- 引擎 ----------
 class FlexFlow:
     def __init__(self, rank, device, role="both", backends=("auto",),
-                 metadata_server=None, topology=None): ...
+                 metadata_server=None, topology=None,
+                 selector_config: SelectorConfig | None = None): ...
+    def update_selector_config(self, cfg: SelectorConfig): ...   # 运行时热更新
     # 注册
     def register_pool(self, tensors, layout, mem_type=None, name=None) -> MemHandle: ...
     def register_file(self, path, size) -> MemHandle: ...
