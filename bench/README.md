@@ -42,13 +42,26 @@ make CUDA_HOME=/usr/local/cuda-11.8 SM_ARCH=80   # A100=80, H100=90, V100=70
 ## 运行
 
 ```bash
-./gdr_vs_memcpy --gpu 0 --csv result.csv
+# 单 QP 基线（离 GPU 最近的 1 张卡，RDMA WRITE）
+./gdr_vs_memcpy --gpu 0 --nics 1 --qp-per-nic 1 --opcode write --csv result_base.csv
+
+# 多 NIC × 多 QP 并发（测能否逼近 PCIe 上限）
+./gdr_vs_memcpy --gpu 0 --nics 4 --qp-per-nic 2 --opcode write --csv result_multi.csv
+
+# RDMA READ 对比
+./gdr_vs_memcpy --gpu 0 --nics 4 --qp-per-nic 2 --opcode read  --csv result_read.csv
+
 # 可选参数：
-#   --gpu N        选择 GPU（默认 0）
-#   --nic mlx5_x   手动指定网卡（默认按亲和性自动选）
-#   --gid IDX      手动指定 RoCE GID index（默认自动找 RoCEv2）
-#   --csv FILE     输出 CSV
+#   --gpu N         选择 GPU（默认 0）
+#   --nics K        使用离 GPU 最近的 K 张网卡并发（默认 1，按亲和性排序）
+#   --qp-per-nic Q  每张网卡上的 QP 数（默认 1）；总并发 lane = K×Q
+#   --opcode write|read  RDMA 操作类型（默认 write）
+#   --gid IDX       手动指定 RoCE GID index（默认自动找 RoCEv2）
+#   --csv FILE      输出 CSV
 ```
+
+> 说明：多 lane 模式把每次测量的 `batch` 个传输按 round-robin 分摊到 `K×Q` 条
+> lane（不同 NIC/QP）上**并发**投递，再统一收割完成，用以观察 GDR 聚合带宽上限。
 
 输出示例（列：方向 / 尺寸 / GDR 带宽 / GDR 时延 / cudaMemcpy 带宽 / cudaMemcpy 时延 / 带宽比）：
 
